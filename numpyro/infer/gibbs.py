@@ -10,6 +10,7 @@ and the pure helpers they share with the HMC-within-Gibbs kernels
 
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
+from contextlib import nullcontext
 import copy
 from functools import partial, reduce
 from typing import Any, NamedTuple, Protocol, TypeAlias
@@ -33,6 +34,7 @@ from numpyro._typing import (
     TraceT,
 )
 from numpyro.handlers import condition, seed, substitute, trace
+from numpyro.infer import _reparam_init
 from numpyro.infer.hmc import HMC
 from numpyro.infer.initialization import init_to_sample
 from numpyro.infer.mcmc import MCMCKernel
@@ -613,7 +615,15 @@ class Gibbs(MCMCKernel):
             if not isinstance(kernel, HMC):
                 params = {**{k: constrained[k] for k in names}, **(params or {})}
             rng_key, key_i = random.split(rng_key)
-            state_i = kernel.init(key_i, num_warmup, params, model_args, kwargs_i)
+            with (
+                _reparam_init.refusing(
+                    "it is initialized in a Gibbs block that is followed by other"
+                    " blocks, which can change the sites it depends on afterwards"
+                )
+                if i < len(self._kernels) - 1
+                else nullcontext()
+            ):
+                state_i = kernel.init(key_i, num_warmup, params, model_args, kwargs_i)
             block_states.append(state_i)
             z_i = getattr(state_i, kernel.sample_field)
             constrained_i = kernel.get_constrain_fn(model_args, kwargs_i)(z_i)

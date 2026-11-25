@@ -19,6 +19,7 @@ from numpyro.distributions.transforms import (
     Transform,
 )
 from numpyro.distributions.util import is_identically_one, safe_normalize, sum_rightmost
+from numpyro.infer import _reparam_init
 from numpyro.infer.autoguide import AutoContinuous
 from numpyro.util import not_jax_tracer
 
@@ -140,7 +141,20 @@ class LocScaleReparam(Reparam):
         decentered_fn = self._wrap(type(fn)(**params), expand_shape, event_dim)
 
         # Draw decentered noise.
-        decentered_value = numpyro.sample("{}_decentered".format(name), decentered_fn)
+        aux_name = "{}_decentered".format(name)
+        if numpyro.handlers._REPARAM_INIT is not None:
+            _reparam_init.set_inverse(
+                self,
+                name,
+                aux_name,
+                lambda x: (
+                    (x - fn.loc) / jnp.power(fn.scale, 1 - centered) + centered * fn.loc
+                ),
+                lambda d: (
+                    fn.loc + jnp.power(fn.scale, 1 - centered) * (d - centered * fn.loc)
+                ),
+            )
+        decentered_value = numpyro.sample(aux_name, decentered_fn)
 
         # Differentiably transform.
         delta = decentered_value - centered * fn.loc
@@ -177,8 +191,17 @@ class TransformReparam(Reparam):
         base_event_dim = event_dim
         for t in reversed(fn.transforms):
             base_event_dim += t.domain.event_dim - t.codomain.event_dim
+        aux_name = "{}_base".format(name)
+        if numpyro.handlers._REPARAM_INIT is not None:
+            _reparam_init.set_inverse(
+                self,
+                name,
+                aux_name,
+                lambda y: _reparam_init._inverse_chain(fn.transforms, y),
+                lambda x: _reparam_init._forward_chain(fn.transforms, x),
+            )
         x = numpyro.sample(
-            "{}_base".format(name),
+            aux_name,
             self._wrap(fn.base_dist, expand_shape, base_event_dim),
         )
 
@@ -205,9 +228,22 @@ class ProjectedNormalReparam(Reparam):
 
         # Draw parameter-free noise.
         new_fn = dist.Normal(jnp.zeros(fn.concentration.shape), 1).to_event(1)
-        x = numpyro.sample(
-            "{}_normal".format(name), self._wrap(new_fn, expand_shape, event_dim)
-        )
+        aux_name = "{}_normal".format(name)
+        if numpyro.handlers._REPARAM_INIT is not None:
+            _reparam_init.set_inverse(
+                self,
+                name,
+                aux_name,
+                lambda u: (
+                    jnp.maximum(
+                        jnp.linalg.norm(fn.concentration, axis=-1, keepdims=True), 1.0
+                    )
+                    * u
+                    - fn.concentration
+                ),
+                lambda x: safe_normalize(x + fn.concentration),
+            )
+        x = numpyro.sample(aux_name, self._wrap(new_fn, expand_shape, event_dim))
 
         # Differentiably transform.
         value = safe_normalize(x + fn.concentration)
@@ -331,6 +367,15 @@ class NeuTraReparam(Reparam):
         return self.guide._unpack_and_constrain(x_unconstrained, self.params)
 
 
+def _circular_inverse(v):
+    # identity on [-pi, pi); +pi (in the closed support) is never produced by the forward
+    # map, so start 16 ulps below it, which the forward map reproduces within tolerance
+    dtype = jnp.result_type(v)
+    pi = jnp.asarray(math.pi, dtype=dtype)
+    below_pi = pi * (1 - 16 * jnp.finfo(dtype).eps)
+    return jnp.where(v == pi, below_pi, v)
+
+
 class CircularReparam(Reparam):
     """
     Reparametrizer for :class:`~numpyro.distributions.VonMises` latent
@@ -347,8 +392,17 @@ class CircularReparam(Reparam):
 
         # Draw parameter-free noise.
         new_fn = dist.ImproperUniform(constraints.real, fn.batch_shape, fn.event_shape)
+        aux_name = f"{name}_unwrapped"
+        if numpyro.handlers._REPARAM_INIT is not None:
+            _reparam_init.set_inverse(
+                self,
+                name,
+                aux_name,
+                _circular_inverse,
+                lambda v: jnp.remainder(v + math.pi, 2 * math.pi) - math.pi,
+            )
         value = numpyro.sample(
-            f"{name}_unwrapped",
+            aux_name,
             new_fn,
             obs=obs,
         )
@@ -403,7 +457,18 @@ class ExplicitReparam(Reparam):
     def __call__(self, name, fn, obs):
         assert obs is None, "ExplicitReparam does not support observe statements"
         transformed = dist.TransformedDistribution(fn, self.transform)
-        x = numpyro.sample(f"{name}_base", transformed)
+        aux_name = f"{name}_base"
+        if numpyro.handlers._REPARAM_INIT is not None:
+            _reparam_init.set_inverse(
+                self,
+                name,
+                aux_name,
+                lambda v: _reparam_init._forward_chain(
+                    _reparam_init._checked(self.transform), v
+                ),
+                lambda x: self.transform.inv(x),
+            )
+        x = numpyro.sample(aux_name, transformed)
         return None, self.transform.inv(x)
 
 
@@ -442,8 +507,19 @@ class UnitJacobianReparam(Reparam):
         base_event_dim = max(event_dim, self.transform.domain.event_dim)
 
         # Draw noise in the reparameterized space.
+        aux_name = f"{name}_{self.suffix}"
+        if numpyro.handlers._REPARAM_INIT is not None:
+            _reparam_init.set_inverse(
+                self,
+                name,
+                aux_name,
+                lambda v: _reparam_init._forward_chain(
+                    _reparam_init._checked(transform), v
+                ),
+                lambda x: transform.inv(x),
+            )
         x = numpyro.sample(
-            f"{name}_{self.suffix}",
+            aux_name,
             dist.TransformedDistribution(
                 self._wrap(fn, expand_shape, base_event_dim), transform
             ),

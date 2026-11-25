@@ -38,7 +38,7 @@ from numpyro.distributions.util import (
     periodic_repeat,
     sum_rightmost,
 )
-from numpyro.infer import Predictive
+from numpyro.infer import Predictive, _reparam_init
 from numpyro.infer.elbo import Trace_ELBO
 from numpyro.infer.initialization import init_to_median, init_to_uniform
 from numpyro.infer.util import (
@@ -162,7 +162,7 @@ class AutoGuide(ABC):
 
     def _setup_prototype(self, *args, **kwargs):
         rng_key = numpyro.prng_key()
-        with handlers.block():
+        with handlers.block(), _reparam_init.suppressed():
             (
                 init_params,
                 self._potential_fn_gen,
@@ -1173,7 +1173,7 @@ class AutoSurrogateLikelihoodDAIS(AutoDAIS):
 
         rng_key = numpyro.prng_key()
 
-        with numpyro.handlers.block():
+        with numpyro.handlers.block(), _reparam_init.suppressed():
             (_, self._surrogate_potential_fn, _, self._surrogate_prototype_trace) = (
                 initialize_model(
                     rng_key,

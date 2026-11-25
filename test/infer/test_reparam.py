@@ -7,6 +7,7 @@ import numpy as np
 from numpy.testing import assert_allclose
 import pytest
 
+import jax
 from jax import jacobian, jit, lax, random
 import jax.numpy as jnp
 
@@ -15,7 +16,7 @@ import numpyro.distributions as dist
 from numpyro.distributions import constraints
 from numpyro.distributions.transforms import AffineTransform, ExpTransform
 import numpyro.handlers as handlers
-from numpyro.infer import MCMC, NUTS, SVI, Trace_ELBO
+from numpyro.infer import MCMC, NUTS, SVI, Trace_ELBO, init_to_value
 from numpyro.infer.autoguide import AutoDiagonalNormal, AutoIAFNormal
 from numpyro.infer.reparam import (
     CircularReparam,
@@ -600,3 +601,400 @@ def test_loc_scale_traced_centered():
         return reparam.centered
 
     assert f(jnp.array(0.5)) == 0.5
+
+
+# init_to_value requests on the original name of a reparameterized site (#1614).
+def _init_model_locscale():
+    mu = numpyro.sample("mu", dist.Normal(1.0, 2.0))
+    with numpyro.plate("p", 3):
+        numpyro.sample("x", dist.Normal(mu, 3.0))
+
+
+def _init_model_circular():
+    phi = numpyro.sample("phi", dist.VonMises(0.5, 2.0))
+    numpyro.sample("obs", dist.Normal(phi, 1.0), obs=0.3)
+
+
+def _init_model_transform():
+    numpyro.sample(
+        "x",
+        dist.TransformedDistribution(
+            dist.Normal(jnp.zeros(3), 1.0).to_event(1),
+            [AffineTransform(1.0, 2.0), ExpTransform()],
+        ),
+    )
+
+
+def _init_model_projected():
+    numpyro.sample("x", dist.ProjectedNormal(jnp.array([1.0, 2.0, 0.5])))
+
+
+def _init_model_vector():
+    numpyro.sample("x", dist.Normal(jnp.zeros(4), 1.0).to_event(1))
+
+
+def _init_model_gamma():
+    numpyro.sample("x", dist.Gamma(4.0, 4.0))
+
+
+INIT_CASES = [
+    (_init_model_locscale, LocScaleReparam(0.0), np.array([0.1, -2.0, 5.0])),
+    (_init_model_locscale, LocScaleReparam(0.4), np.array([0.1, -2.0, 5.0])),
+    (_init_model_circular, CircularReparam(), np.array(0.5)),
+    (_init_model_transform, TransformReparam(), np.array([0.5, 1.0, 4.0])),
+    (
+        _init_model_projected,
+        ProjectedNormalReparam(),
+        np.array([0.6, 0.0, 0.8]),
+    ),
+    (_init_model_vector, HaarReparam(), np.array([0.1, -0.2, 0.3, 0.4])),
+    (_init_model_vector, DiscreteCosineReparam(), np.array([0.1, -0.2, 0.3, 0.4])),
+    (
+        _init_model_gamma,
+        ExplicitReparam(dist.transforms.SoftplusTransform().inv),
+        np.array(1.25),
+    ),
+]
+
+
+@pytest.mark.parametrize("model, reparam, value", INIT_CASES)
+def test_init_to_value_original_name(model, reparam, value):
+    name = "phi" if model is _init_model_circular else "x"
+    reparam_model = handlers.reparam(model, config={name: reparam})
+    info = initialize_model(
+        random.PRNGKey(0),
+        reparam_model,
+        init_strategy=init_to_value(values={name: value}),
+    )
+    actual = info.postprocess_fn(info.param_info.z)[name]
+    assert_allclose(actual, value, rtol=1e-5, atol=1e-5)
+    assert_allclose(info.model_trace[name]["value"], value, rtol=1e-5, atol=1e-5)
+
+
+def test_init_to_value_original_name_issue_1614():
+    def model():
+        angle = numpyro.sample("loc_1", dist.VonMises(0, 100))
+        with numpyro.plate("plate", 3):
+            numpyro.sample("y", dist.VonMises(angle, 2), obs=jnp.arange(1, 4))
+
+    reparam_model = handlers.reparam(model, config={"loc_1": CircularReparam()})
+    kernel = NUTS(reparam_model, init_strategy=init_to_value(values={"loc_1": 0.5}))
+    for chain_method, num_chains in [("sequential", 1), ("vectorized", 2)]:
+        mcmc = MCMC(
+            kernel,
+            num_warmup=0,
+            num_samples=1,
+            num_chains=num_chains,
+            chain_method=chain_method,
+            progress_bar=False,
+        )
+        mcmc.warmup(random.PRNGKey(1))
+        z = mcmc.post_warmup_state.z
+        if num_chains > 1:
+            z = {k: v[0] for k, v in z.items()}
+        assert_allclose(kernel.postprocess_fn((), {})(z)["loc_1"], 0.5, atol=1e-5)
+
+
+def test_init_to_value_original_name_untouched():
+    reparam_model = handlers.reparam(
+        _init_model_locscale, config={"x": LocScaleReparam(0.0)}
+    )
+
+    def init(strategy):
+        info = initialize_model(
+            random.PRNGKey(0), reparam_model, init_strategy=strategy
+        )
+        return info.param_info.z
+
+    class Values(dict):
+        pass
+
+    expected = init(init_to_value(values={"other": 0.0}))
+    value = jnp.array([0.1, -2.0, 5.0])
+    # out of scope: identical to a request that names no site
+    for strategy in [
+        init_to_value(values=Values(x=value)),
+        lambda site=None: init_to_value(site, values={"x": value}),
+    ]:
+        actual = init(strategy)
+        for k in expected:
+            assert_allclose(actual[k], expected[k], rtol=0, atol=0)
+    # an explicit auxiliary request wins over the original
+    aux = jnp.array([1.0, 2.0, 3.0])
+    z = init(init_to_value(values={"x": value, "x_decentered": aux}))
+    assert_allclose(z["x_decentered"], aux)
+
+
+@pytest.mark.parametrize(
+    "model, reparam, value, error",
+    [
+        (
+            lambda: numpyro.sample(
+                "x",
+                dist.TransformedDistribution(
+                    dist.Uniform(-4.0, -1.0), dist.transforms.AbsTransform()
+                ),
+            ),
+            TransformReparam(),
+            2.5,
+            NotImplementedError,
+        ),
+        (_init_model_locscale, LocScaleReparam(0.0), 1.0, ValueError),
+        (_init_model_circular, CircularReparam(), 4.0, ValueError),
+        (_init_model_projected, ProjectedNormalReparam(), np.ones(3), ValueError),
+    ],
+)
+def test_init_to_value_original_name_raises(model, reparam, value, error):
+    name = "phi" if model is _init_model_circular else "x"
+    reparam_model = handlers.reparam(model, config={name: reparam})
+    with pytest.raises(error, match=f"'{name}'"):
+        initialize_model(
+            random.PRNGKey(0),
+            reparam_model,
+            init_strategy=init_to_value(values={name: value}),
+        )
+
+
+def test_init_to_value_original_name_jit_raises():
+    reparam_model = handlers.reparam(
+        _init_model_locscale, config={"x": LocScaleReparam(0.0)}
+    )
+
+    @jit
+    def f(key):
+        info = initialize_model(
+            key,
+            reparam_model,
+            init_strategy=init_to_value(values={"x": jnp.zeros(3)}),
+        )
+        return info.param_info.z
+
+    with pytest.raises(NotImplementedError, match="'x'"):
+        f(random.PRNGKey(0))
+
+
+def test_init_to_value_original_name_autoguide_unchanged():
+    # AutoGuides are out of scope: the original-name request is ignored as before.
+    reparam_model = handlers.reparam(
+        _init_model_locscale, config={"x": LocScaleReparam(0.0)}
+    )
+    value = jnp.array([0.1, -2.0, 5.0])
+    guide = AutoDiagonalNormal(
+        reparam_model, init_loc_fn=init_to_value(values={"x": value})
+    )
+    ref = AutoDiagonalNormal(
+        reparam_model, init_loc_fn=init_to_value(values={"other": 0.0})
+    )
+    svi = SVI(reparam_model, guide, Adam(0.1), Trace_ELBO())
+    svi_ref = SVI(reparam_model, ref, Adam(0.1), Trace_ELBO())
+    loc = svi.get_params(svi.init(random.PRNGKey(0)))["auto_loc"]
+    loc_ref = svi_ref.get_params(svi_ref.init(random.PRNGKey(0)))["auto_loc"]
+    assert_allclose(loc, loc_ref, rtol=0, atol=0)
+
+
+def test_init_to_value_original_name_hidden_raises():
+    # the original site is hidden from initialization by `block`: refuse loudly
+    reparam_model = handlers.block(
+        handlers.reparam(_init_model_locscale, config={"x": LocScaleReparam(0.0)}),
+        hide=["x"],
+    )
+    with pytest.raises(NotImplementedError, match="'x'"):
+        initialize_model(
+            random.PRNGKey(0),
+            reparam_model,
+            init_strategy=init_to_value(values={"x": np.zeros(3)}),
+        )
+
+
+def test_init_to_value_original_name_circular_pi():
+    # +pi is in the closed support of VonMises but never produced by CircularReparam;
+    # the site starts within tolerance below it
+    reparam_model = handlers.reparam(
+        _init_model_circular, config={"phi": CircularReparam()}
+    )
+    info = initialize_model(
+        random.PRNGKey(0),
+        reparam_model,
+        init_strategy=init_to_value(values={"phi": np.pi}),
+    )
+    actual = info.postprocess_fn(info.param_info.z)["phi"]
+    assert_allclose(actual, np.pi, rtol=1e-4)
+
+
+def test_init_to_value_original_name_scope_prefix():
+    # a scope (with a non-str prefix) between the reparam and the initialization
+    reparam_model = handlers.scope(
+        handlers.reparam(_init_model_locscale, config={"x": LocScaleReparam(0.0)}),
+        prefix=0,
+    )
+    value = np.array([0.1, -2.0, 5.0])
+    info = initialize_model(
+        random.PRNGKey(0),
+        reparam_model,
+        init_strategy=init_to_value(values={"0/x": value}),
+    )
+    assert_allclose(info.postprocess_fn(info.param_info.z)["0/x"], value, rtol=1e-5)
+
+
+def test_init_to_value_original_name_gibbs():
+    from numpyro.infer import Gibbs
+
+    def model():
+        mu = numpyro.sample("mu", dist.Normal(0.0, 1.0))
+        numpyro.sample("x", dist.Normal(mu, 2.0))
+
+    reparam_model = handlers.reparam(model, config={"x": LocScaleReparam(0.0)})
+
+    def run(first, second):
+        kernel = Gibbs(
+            [
+                (
+                    NUTS(reparam_model, init_strategy=init_to_value(values=first)),
+                    ["mu"],
+                ),
+                (NUTS(reparam_model, init_strategy=init_to_value(values=second)), None),
+            ]
+        )
+        mcmc = MCMC(kernel, num_warmup=0, num_samples=1, progress_bar=False)
+        mcmc.warmup(random.PRNGKey(0))
+        return mcmc.post_warmup_state.z
+
+    # the last block is initialized against the final values of the other blocks
+    z = run({"mu": 3.0}, {"x": 1.5})
+    assert_allclose(z["mu"] + 2.0 * z["x_decentered"], 1.5, rtol=1e-5)
+    # an earlier block could be invalidated by later blocks: refuse
+    kernel = Gibbs(
+        [
+            (NUTS(reparam_model, init_strategy=init_to_value(values={"x": 1.5})), None),
+            (
+                NUTS(reparam_model, init_strategy=init_to_value(values={"mu": 3.0})),
+                ["mu"],
+            ),
+        ]
+    )
+    mcmc = MCMC(kernel, num_warmup=0, num_samples=1, progress_bar=False)
+    with pytest.raises(NotImplementedError, match="'x'"):
+        mcmc.warmup(random.PRNGKey(0))
+
+
+def test_init_to_value_original_name_sa_raises():
+    from numpyro.infer import SA
+
+    def model():
+        with handlers.reparam(config={"x": LocScaleReparam(0.0)}):
+            numpyro.sample("x", dist.Normal(3.0, 2.0))
+
+    kernel = SA(model, init_strategy=init_to_value(values={"x": 7.0}))
+    with pytest.raises(NotImplementedError, match="'x'"):
+        kernel.init(random.PRNGKey(0), 0, None, (), {})
+    # explicit auxiliary request still works identically to master
+    aux_kernel = SA(model, init_strategy=init_to_value(values={"x_decentered": 2.0}))
+    state = aux_kernel.init(random.PRNGKey(0), 0, None, (), {})
+    assert jnp.isfinite(state.z["x_decentered"])
+
+
+def test_init_to_value_original_name_replay_mismatch_raises():
+    # SigmoidTransform clips expit at 1 - finfo.eps, so 1 - eps/2 cannot be reproduced on replay.
+    scale = 2.0 ** (49 if jax.config.x64_enabled else 20)
+
+    def near_end():
+        with handlers.reparam(config={"x": TransformReparam()}):
+            numpyro.sample(
+                "x",
+                dist.TransformedDistribution(
+                    dist.Uniform(0.0, 1.0),
+                    AffineTransform(-(scale - 0.0625), scale),
+                ),
+            )
+
+    with pytest.raises(ValueError, match=r"'x'.*coordinate \(\).*0\.0.*-0\.0625"):
+        initialize_model(
+            random.PRNGKey(0), near_end, init_strategy=init_to_value(values={"x": 0.0})
+        )
+
+    # Interior 31-coordinate vector whose unconstrained round trip rounds past tolerance.
+    centers = jnp.arange(1, 32, dtype=jnp.float32) / 32
+
+    def bounded():
+        with handlers.reparam(config={"x": TransformReparam()}):
+            numpyro.sample(
+                "x",
+                dist.TransformedDistribution(
+                    dist.Uniform(jnp.zeros_like(centers), jnp.ones_like(centers)),
+                    AffineTransform(-(2**20) * centers, float(2**20)),
+                ).to_event(1),
+            )
+
+    with pytest.raises(ValueError, match=r"'x'.*coordinates differ.*\(0,\)|\(2,\)"):
+        initialize_model(
+            random.PRNGKey(0),
+            bounded,
+            init_strategy=init_to_value(values={"x": jnp.zeros(31)}),
+        )
+
+
+def test_init_to_value_original_name_complex_raises():
+    import warnings
+
+    def model():
+        with handlers.reparam(config={"x": LocScaleReparam(0.0)}):
+            numpyro.sample("x", dist.Normal(3.0, 2.0))
+
+    with warnings.catch_warnings(record=True) as ws:
+        warnings.simplefilter("always")
+        with pytest.raises(ValueError, match="'x'"):
+            initialize_model(
+                random.PRNGKey(0),
+                model,
+                init_strategy=init_to_value(values={"x": 7.0 + 12.0j}),
+            )
+    assert len(ws) == 0
+
+
+def test_init_to_value_original_name_suffix_format_once():
+    from numpyro.distributions.transforms import IdentityTransform
+    from numpyro.infer.reparam import UnitJacobianReparam
+
+    calls = []
+
+    class Suffix(str):
+        def __format__(self, spec):
+            calls.append(spec)
+            return super().__format__(spec)
+
+    suffix = Suffix("aux")
+
+    def model():
+        numpyro.sample("other", dist.Normal(0.0, 1.0))
+        with handlers.reparam(
+            config={"x": UnitJacobianReparam(IdentityTransform(), suffix)}
+        ):
+            numpyro.sample("x", dist.Normal(0.0, 1.0))
+
+    initialize_model(
+        random.PRNGKey(0), model, init_strategy=init_to_value(values={"other": 0.75})
+    )
+    unreq_calls = len(calls)
+    calls.clear()
+    initialize_model(random.PRNGKey(0), model, init_strategy=init_to_value(values={}))
+    assert unreq_calls == len(calls)
+
+
+def test_init_to_value_original_name_barker_and_ensemble():
+    from numpyro.infer import AIES, ESS, BarkerMH
+
+    def model():
+        mu = numpyro.sample("mu", dist.Normal(1.0, 1.0))
+        with handlers.reparam(config={"x": LocScaleReparam(0.0)}):
+            numpyro.sample("x", dist.Normal(mu, 2.0))
+
+    strategy = init_to_value(values={"x": 7.0})
+    barker = BarkerMH(model, init_strategy=strategy)
+    bstate = barker.init(random.PRNGKey(0), 0, None, (), {})
+    assert_allclose(barker.postprocess_fn((), {})(bstate.z)["x"], 7.0, rtol=1e-5)
+
+    for cls in (AIES, ESS):
+        ens = cls(model, init_strategy=strategy)
+        estate = ens.init(random.split(random.PRNGKey(0), 4), 0, None, (), {})
+        got = jax.vmap(ens.postprocess_fn((), {}))(estate.z)["x"]
+        assert_allclose(got, jnp.full((4,), 7.0), rtol=1e-5)

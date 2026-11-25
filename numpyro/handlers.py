@@ -95,7 +95,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from types import TracebackType
-from typing import TYPE_CHECKING, Callable, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Callable, Optional, Union, cast
 import warnings
 
 import numpy as np
@@ -650,6 +650,11 @@ class mask(Messenger):
         msg["fn"] = msg["fn"].mask(self.mask)
 
 
+# Set only while `initialize_model` traces a model for an `init_to_value` request
+# (see `numpyro.infer._reparam_init`); `None` otherwise.
+_REPARAM_INIT: Optional[Any] = None
+
+
 class reparam(Messenger):
     """
     Reparametrizes each affected sample site into one or more auxiliary sample
@@ -701,7 +706,17 @@ class reparam(Messenger):
             return
 
         reparam = cast("Reparam", reparam)
-        new_fn, value = reparam(msg["name"], msg["fn"], msg["value"])
+        recorder = _REPARAM_INIT
+        if recorder is not None and msg["value"] is None:
+            # initialize_model is recording reparameterized sites (#1614)
+            record = recorder.open(self, msg, reparam)
+            new_fn = value = None
+            try:
+                new_fn, value = reparam(msg["name"], msg["fn"], msg["value"])
+            finally:
+                recorder.close(record, new_fn, value)
+        else:
+            new_fn, value = reparam(msg["name"], msg["fn"], msg["value"])
 
         if value is not None:
             if new_fn is None:

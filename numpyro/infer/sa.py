@@ -10,6 +10,7 @@ from jax.scipy.special import logsumexp
 
 import numpyro.distributions as dist
 from numpyro.distributions.util import cholesky_update
+from numpyro.infer import _reparam_init
 from numpyro.infer.mcmc import MCMCKernel
 from numpyro.infer.util import init_to_uniform, initialize_model
 from numpyro.util import identity, is_prng_key
@@ -305,15 +306,19 @@ class SA(MCMCKernel):
 
     def _init_state(self, rng_key, model_args, model_kwargs, init_params):
         if self._model is not None:
-            init_params, potential_fn, postprocess_fn, _ = initialize_model(
-                rng_key,
-                self._model,
-                dynamic_args=True,
-                init_strategy=self._init_strategy,
-                model_args=model_args,
-                model_kwargs=model_kwargs,
-                validate_grad=False,
-            )
+            with _reparam_init.refusing(
+                "SA perturbs the initial parameters into a proposal cloud and selects a"
+                " random member, so its iteration-zero state does not match init_to_value"
+            ):
+                init_params, potential_fn, postprocess_fn, _ = initialize_model(
+                    rng_key,
+                    self._model,
+                    dynamic_args=True,
+                    init_strategy=self._init_strategy,
+                    model_args=model_args,
+                    model_kwargs=model_kwargs,
+                    validate_grad=False,
+                )
             init_params = init_params[0]
             # NB: init args is different from HMC
             self._init_fn, sample_fn = _sa(potential_fn_gen=potential_fn)

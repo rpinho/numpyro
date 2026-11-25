@@ -3,7 +3,7 @@
 
 from collections import namedtuple
 from collections.abc import Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from typing import Callable, NamedTuple, Optional
 import warnings
@@ -23,6 +23,7 @@ from numpyro.distributions import constraints
 from numpyro.distributions.transforms import biject_to
 from numpyro.distributions.util import is_identically_one, sum_rightmost
 from numpyro.handlers import condition, replay, seed, substitute, trace
+from numpyro.infer import _reparam_init
 from numpyro.infer.initialization import init_to_uniform, init_to_value
 from numpyro.primitives import Messenger
 from numpyro.util import (
@@ -788,16 +789,29 @@ def initialize_model(
         at `deterministic` sites in the model.
     """
     model_kwargs = {} if model_kwargs is None else model_kwargs
+    # `init_to_value` requests on the original name of reparameterized sites (#1614);
+    # `None` (exactly the previous behavior) unless the strategy is in scope.
+    reparam_init = _reparam_init.make_state(init_strategy)
+    prototype_strategy = (
+        init_strategy if reparam_init is None else reparam_init.strategy_for()
+    )
     substituted_model = substitute(
         seed(model, rng_key if is_prng_key(rng_key) else rng_key[0]),
-        substitute_fn=init_strategy,
+        substitute_fn=prototype_strategy,
     )
-    (
-        inv_transforms,
-        replay_model,
-        has_enumerate_support,
-        model_trace,
-    ) = _get_model_transforms(substituted_model, model_args, model_kwargs)
+    with (
+        nullcontext()
+        if reparam_init is None
+        else reparam_init.recording(prototype_strategy, prototype=True)
+    ) as recorder:
+        (
+            inv_transforms,
+            replay_model,
+            has_enumerate_support,
+            model_trace,
+        ) = _get_model_transforms(substituted_model, model_args, model_kwargs)
+        if recorder is not None:
+            recorder.finish(model_trace)
 
     for name, site in model_trace.items():
         if (
@@ -838,24 +852,29 @@ def initialize_model(
         unconstrained_values = transform_fn(inv_transforms, init_values, invert=True)
         init_strategy = _init_to_unconstrained_value(values=unconstrained_values)
     prototype_params = transform_fn(inv_transforms, constrained_values, invert=True)
-    (init_params, pe, grad), is_valid = find_valid_initial_params(
-        rng_key,
-        substitute(
-            model,
-            data={
-                k: site["value"]
-                for k, site in model_trace.items()
-                if site["type"] in ["plate"]
-            },
-        ),
-        init_strategy=init_strategy,
-        enum=has_enumerate_support,
-        model_args=model_args,
-        model_kwargs=model_kwargs,
-        prototype_params=prototype_params,
-        forward_mode_differentiation=forward_mode_differentiation,
-        validate_grad=validate_grad,
-    )
+    recording = nullcontext()
+    if reparam_init is not None and reparam_init.translated:
+        init_strategy = reparam_init.strategy_for()
+        recording = reparam_init.recording(init_strategy, prototype=False)
+    with recording:
+        (init_params, pe, grad), is_valid = find_valid_initial_params(
+            rng_key,
+            substitute(
+                model,
+                data={
+                    k: site["value"]
+                    for k, site in model_trace.items()
+                    if site["type"] in ["plate"]
+                },
+            ),
+            init_strategy=init_strategy,
+            enum=has_enumerate_support,
+            model_args=model_args,
+            model_kwargs=model_kwargs,
+            prototype_params=prototype_params,
+            forward_mode_differentiation=forward_mode_differentiation,
+            validate_grad=validate_grad,
+        )
 
     if not_jax_tracer(is_valid):
         if device_get(~jnp.all(is_valid)):
@@ -890,6 +909,16 @@ def initialize_model(
             raise RuntimeError(
                 "Cannot find valid initial parameters. Please check your model again."
             )
+    if reparam_init is not None and reparam_init.translated:
+        reparam_init.verify_replay(
+            init_params,
+            is_valid,
+            postprocess_fn,
+            rng_key,
+            dynamic_args,
+            model_args,
+            model_kwargs,
+        )
     return ModelInfo(
         ParamInfo(init_params, pe, grad), potential_fn, postprocess_fn, model_trace
     )
